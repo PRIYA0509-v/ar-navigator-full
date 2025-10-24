@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AR Navigator — demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; margin:0; display:flex; height:100vh; }
+    .sidebar { width:380px; padding:18px; box-shadow: 2px 0 8px rgba(0,0,0,0.08); overflow:auto }
+    h1 { font-size:18px; margin:0 0 12px }
+    label{ display:block; margin-top:10px; font-weight:600 }
+    input, select, button { width:100%; padding:8px; margin-top:6px; font-size:14px }
+    #qr { margin-top:12px }
+    #scanner { width:100%; height:260px; background:#222; margin-top:8px; }
+    .mapless-ar { position:relative; flex:1; display:flex; align-items:center; justify-content:center; background:#f6f7fb }
+    .arrow { width:140px; height:140px; transform-origin:center center; transition: transform 0.2s linear; }
+    .distance { position:absolute; top:18px; left:18px; background:white; padding:8px 12px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.12) }
+    .marker { position:absolute; bottom:48px; right:18px; background:white; padding:10px; border-radius:12px }
+    small { color:#666 }
+  </style>
+</head>
+<body>
+  <div class="sidebar">
+    <h1>AR Navigator — demo (single file)</h1>
+    <small>Flow: generate or scan a QR (sets start). Confirm location. Choose destination (or speak). Then press Start Navigation to see a live directional arrow that updates as you move.</small>
+
+    <label>1) Generate QR for a starting location (optional)</label>
+    <input id="genLat" placeholder="Start latitude (e.g. 37.7749)" />
+    <input id="genLng" placeholder="Start longitude (e.g. -122.4194)" />
+    <button id="genBtn">Generate QR</button>
+    <div id="qr"></div>
+
+    <label>2) Or scan QR to set start location</label>
+    <div id="scanner"></div>
+    <button id="startScanner">Open camera scanner</button>
+    <button id="stopScanner" style="display:none">Stop scanner</button>
+
+    <label>3) Confirm starting location</label>
+    <div id="startInfo">No start set.</div>
+    <button id="useDeviceLoc">Or use device GPS as start</button>
+
+    <label>4) Choose destination (or use voice)</label>
+    <select id="destSelect">
+      <option value="">-- pick a destination --</option>
+      <option data-lat="37.7749" data-lng="-122.4194">Sample: Lab A (SF)</option>
+      <option data-lat="37.7755" data-lng="-122.4180">Sample: Lab B (SF)</option>
+      <option data-lat="37.7765" data-lng="-122.4170">Sample: Lab C (SF)</option>
+    </select>
+    <button id="voiceBtn">🎤 Speak destination</button>
+
+    <label>5) Start Guidance</label>
+    <button id="startNav">Start Navigation</button>
+    <button id="stopNav" style="display:none">Stop Navigation</button>
+
+    <hr />
+    <small>Notes: This demo uses <em>device GPS</em> and <em>device orientation</em> when available. For full AR overlays you can integrate AR.js / WebXR — this demo shows a robust, mapless directional arrow overlay that works indoors/outdoors if device sensors are available.</small>
+  </div>
+
+  <div class="mapless-ar">
+    <div class="distance" id="distanceBox">Distance: —</div>
+    <svg class="arrow" id="arrow" viewBox="0 0 100 100">
+      <polygon points="50,5 90,95 50,78 10,95" fill="#0a9" />
+    </svg>
+    <div class="marker" id="markerBox">Destination: —</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/minified/html5-qrcode.min.js"></script>
+
+  <script>
+    function toRad(d){ return d * Math.PI/180 }
+    function toDeg(r){ return r * 180/Math.PI }
+
+    function haversineDistance(lat1, lon1, lat2, lon2){
+      var R = 6371000;
+      var dLat = toRad(lat2 - lat1);
+      var dLon = toRad(lon2 - lon1);
+      var a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    function bearingBetween(lat1, lon1, lat2, lon2){
+      var phi1 = toRad(lat1);
+      var phi2 = toRad(lat2);
+      var lambda1 = toRad(lon1);
+      var lambda2 = toRad(lon2);
+      var y = Math.sin(lambda2 - lambda1) * Math.cos(phi2);
+      var x = Math.cos(phi1)*Math.sin(phi2) - Math.sin(phi1)*Math.cos(phi2)*Math.cos(lambda2 - lambda1);
+      var theta = Math.atan2(y, x);
+      return (toDeg(theta) + 360) % 360;
+    }
+
+    let deviceHeading = null;
+    if (window.DeviceOrientationEvent) {
+      window.addEventListener('deviceorientationabsolute', ev => { if(ev.alpha !== null) deviceHeading = ev.alpha; }, true);
+      window.addEventListener('deviceorientation', ev => { if(ev.webkitCompassHeading) deviceHeading = ev.webkitCompassHeading; else if(ev.alpha !== null) deviceHeading = ev.alpha; }, true);
+    }
+
+    const qrContainer = document.getElementById('qr');
+    document.getElementById('genBtn').addEventListener('click', ()=>{
+      const lat = parseFloat(document.getElementById('genLat').value);
+      const lng = parseFloat(document.getElementById('genLng').value);
+      if (isNaN(lat) || isNaN(lng)) return alert('Enter valid lat and lng');
+      qrContainer.innerHTML = '';
+      new QRCode(qrContainer, { text: JSON.stringify({lat, lng}), width: 200, height: 200 });
+    });
+
+    let html5Scanner = null;
+    document.getElementById('startScanner').addEventListener('click', async ()=>{
+      const scannerDiv = document.getElementById('scanner');
+      html5Scanner = new Html5Qrcode("scanner", { fps: 10, qrbox: 250 });
+      try{
+        await Html5Qrcode.getCameras().then(cameras => {
+          const camId = cameras.length ? cameras[0].id : null;
+          if(!camId) throw new Error('No camera found');
+          html5Scanner.start(camId, { fps: 10, qrbox: 250 }, qrSuccess, qrError);
+          document.getElementById('startScanner').style.display='none';
+          document.getElementById('stopScanner').style.display='inline-block';
+        });
+      }catch(e){ alert('Camera error: ' + e.message); }
+    });
+    document.getElementById('stopScanner').addEventListener('click', ()=>{
+      if(html5Scanner){ html5Scanner.stop().then(()=>{ html5Scanner.clear(); html5Scanner = null; document.getElementById('startScanner').style.display='inline-block'; document.getElementById('stopScanner').style.display='none'; document.getElementById('scanner').innerHTML=''; }); }
+    });
+
+    function qrSuccess(decodedText){
+      try{ const obj = JSON.parse(decodedText); if(obj.lat && obj.lng){ setStart(obj.lat, obj.lng, 'QR'); } else alert('QR missing lat/lng'); }
+      catch(e){ alert('QR payload: ' + decodedText); }
+      if(html5Scanner) html5Scanner.stop().then(()=>{ html5Scanner.clear(); html5Scanner = null; document.getElementById('startScanner').style.display='inline-block'; document.getElementById('stopScanner').style.display='none'; document.getElementById('scanner').innerHTML=''; }); 
+    }
+    function qrError(err){}
+
+    let start = null;
+    function setStart(lat, lng, src){ start = {lat:+lat, lng:+lng}; document.getElementById('startInfo').innerText = `Start: ${lat.toFixed(6)}, ${lng.toFixed(6)} (${src})`; }
+
+    document.getElementById('useDeviceLoc').addEventListener('click', ()=>{
+      navigator.geolocation.getCurrentPosition(pos=>setStart(pos.coords.latitude, pos.coords.longitude,'GPS'), err=>alert(err.message));
+    });
+
+    const destSelect = document.getElementById('destSelect');
+    function getDest(){ const o = destSelect.selectedOptions[0]; return o && o.value ? {name:o.text, lat:+o.dataset.lat, lng:+o.dataset.lng} : null; }
+
+    let recognition = null;
+    if('webkitSpeechRecognition' in window || 'SpeechRecognition' in window){
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SR(); recognition.lang='en-US'; recognition.onresult=e=>{const t=e.results[0][0].transcript.toLowerCase(); for(const opt of destSelect.options){ if(opt.text.toLowerCase().includes(t)){ destSelect.value=opt.value; return; } } alert('Heard: '+t);};
+    } else document.getElementById('voiceBtn').disabled=true;
+    document.getElementById('voiceBtn').addEventListener('click', ()=> recognition && recognition.start());
+
+    let watchId=null;
+    document.getElementById('startNav').addEventListener('click', ()=>{
+      const d=getDest(); if(!start) return alert('Set start'); if(!d) return alert('Choose dest');
+      document.getElementById('markerBox').innerText='Destination: '+d.name;
+      watchId=navigator.geolocation.watchPosition(p=>updateArrow(p.coords.latitude,p.coords.longitude,d.lat,d.lng), console.warn,{enableHighAccuracy:true});
+      document.getElementById('startNav').style.display='none'; document.getElementById('stopNav').style.display='inline-block';
+    });
+    document.getElementById('stopNav').addEventListener('click',()=>{navigator.geolocation.clearWatch(watchId);watchId=null;document.getElementById('startNav').style.display='inline-block';document.getElementById('stopNav').style.display='none';document.getElementById('distanceBox').innerText='Distance: —';document.getElementById('markerBox').innerText='Destination: —';});
+
+    function updateArrow(curLat,curLng,destLat,destLng){
+      const dist=haversineDistance(curLat,curLng,destLat,destLng);
+      document.getElementById('distanceBox').innerText='Distance: '+(dist>1000?(dist/1000).toFixed(2)+' km':Math.round(dist)+' m');
+      const brng=bearingBetween(curLat,curLng,destLat,destLng);
+      let rot=brng; if(deviceHeading!==null) rot=(brng-deviceHeading+360)%360;
+      document.getElementById('arrow').style.transform=`rotate(${rot}deg)`;
+      if(dist<4){ document.getElementById('markerBox').innerText='You have arrived!'; document.getElementById('distanceBox').innerText='Distance: 0 m'; }
+    }
+  </script>
+</body>
+</html>
